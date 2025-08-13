@@ -3,7 +3,7 @@ import gymnasium as gym
 import gymnasium_robotics
 import numpy as np
 import torch
-from cnmp import CNMP, CNMP_H, generate_trajectory # Assuming these are your custom modules
+from cnmp_ import CNMP_H, generate_trajectory # Assuming these are your custom modules
 from scipy.interpolate import interp1d
 from scipy.spatial import ConvexHull
 import matplotlib.pyplot as plt
@@ -16,31 +16,55 @@ os.makedirs(video_folder, exist_ok=True)
 
 # --- Model and Data Loading (Unchanged) ---
 model = CNMP_H(d_x=1, d_y=30, d_SM=30).double()
-model.load_state_dict(torch.load("save/best_model_newdataset_diff_hierarch.pth"))
+model.load_state_dict(torch.load("save/best_models_v2/cnmp_model_22400.pth"))
 model.eval()
 
 dataset = minari.load_dataset('D4RL/relocate/human-v2')
+normalization_values = {"actions_min": [],
+                        "actions_max": [],
+                        "context_min": [],
+                        "context_max": []}
 
-# --- Plotting Setup (Unchanged) ---
-fig, axs = plt.subplots(3, 1, figsize=(10, 15))
+time_len = 451
+X = np.tile(np.linspace(0, 1, time_len).reshape((1, time_len, 1)), (23, 1, 1))  # 23 trajectories
+action_data = np.load('data/long_actions.npy')[:] # Use only the first 23
+observation_data = np.load('data/long_observations.npy')[:] # Use only the first 23
 
-training_region = np.zeros((25, 6), dtype=np.float64)
-for i in range(25):
-    episode = dataset[i]
-    obs = episode.observations
-    training_region[i, :] = obs[0, -9:-3]
-    axs[0].scatter(obs[0, -9], obs[0, -8], c='black', label='Hand to Ball')
-    axs[1].scatter(obs[0, -7], obs[0, -6], c='black', label='Hand to Target')
-    axs[2].scatter(obs[0, -5], obs[0, -4], c='black', label='Ball to Target')
+print('Action data shape:', action_data.shape)
+
+Y = np.zeros((24, time_len, 30))
+Y[:, 1:] = action_data
+C = np.zeros((24, 15))
+for i in range(24):
+    C[i, :9] = observation_data[i, 0, 30:39]
+    C[i, 9:] = observation_data[i, 0, 42:]
+
+# --- Normalization (Unchanged) ---
+for dim in range(Y.shape[-1]):
+    Y_min = np.min(Y[:, :, dim], axis=(0, 1), keepdims=True)
+    Y_max = np.max(Y[:, :, dim], axis=(0, 1), keepdims=True)
+    normalization_values['actions_min'].append(Y_min)
+    normalization_values['actions_max'].append(Y_max)
+    Y[:, :, dim] = (Y[:, :, dim] - Y_min) / (Y_max - Y_min + 1e-8)
+
+for dim in range(C.shape[-1]):
+    C_min = np.min(C[:, dim], axis=0, keepdims=True)
+    C_max = np.max(C[:, dim], axis=0, keepdims=True)
+    normalization_values['context_min'].append(C_min)
+    normalization_values['context_max'].append(C_max)
+    C[:, dim] = (C[:, dim] - C_min) / (C_max - C_min + 1e-8)
 
 # --- Corrected Evaluation Loop with Recording and Renaming ---
 success_count = 0.0
-num_tests = 100
+num_tests = 1
+test_contexts = []
+success_list = []
+seed = 455
 
 for i in range(num_tests):
     # Set a unique, temporary prefix for this test's video
     # This avoids overwriting and allows us to find the file later
-    temp_name_prefix = f"test-run-{i}"
+    temp_name_prefix = f"{seed}"
 
     env = dataset.recover_environment(max_episode_steps=450, render_mode='rgb_array')
 
@@ -52,75 +76,86 @@ for i in range(num_tests):
         episode_trigger=lambda x: True # Record this one episode
     )
 
-    obs, _ = env.reset(seed=420+i)
+
+    obs_, _ = env.reset(seed=seed)
 
     # --- Trajectory Generation and Execution (Unchanged) ---
-    cnmp_obs = np.array([np.concatenate((np.array([0.0]), obs[:30]), axis=-1)])
-    
-    context = np.zeros((12))  # Adjusted context size to match the model's expectation
-    context[0:6] = obs[30:36]
-    init_state_dict = env.unwrapped.get_env_state()
-    context[6:9] = init_state_dict['obj_pos']
-    context[9:12] = init_state_dict['target_pos']
+    cnmp_obs = np.array([np.concatenate((np.array([0.0]), Y[0, 0, :]), axis=-1)])
 
-    traj_length = 400
-    action_trajectory = generate_trajectory(model, cnmp_obs, context).squeeze(0)
+    # Re-calculate the CNMP context based on the new state
+    current_state = env.unwrapped.get_env_state()
+    context_for_cnmp = np.zeros(15)
+    context_for_cnmp[:9] = obs_[30:39]
+    context_for_cnmp[9:12] = current_state['obj_pos']
+    context_for_cnmp[12:15] = current_state['target_pos']
+
+    # Normalize the CNMP context
+    for dim in range(15):
+        context_for_cnmp[dim] = (context_for_cnmp[dim] - normalization_values['context_min'][dim]) / \
+                                (normalization_values['context_max'][dim] - normalization_values['context_min'][dim] + 1e-8)
+
+    test_contexts.append(context_for_cnmp)
+
+    traj_length = 450
+    action_trajectory = generate_trajectory(model, cnmp_obs, context_for_cnmp).squeeze(0)
     action_trajectory = action_trajectory.detach().numpy()
     action_trajectory = interp1d(np.linspace(0, 1, len(action_trajectory)), action_trajectory, axis=0)(np.linspace(0, 1, traj_length))
 
+    for dim in range(action_trajectory.shape[-1]):
+        action_trajectory[:, dim] = (action_trajectory[:, dim] *
+                                     (normalization_values['actions_max'][dim] - normalization_values['actions_min'][dim]) +
+                                     normalization_values['actions_min'][dim])
+
     for step_num in range(450):
-        if step_num < traj_length:
-            action = action_trajectory[step_num]
-        else:
-            action = action_trajectory[-1]
-        obs, rew, terminated, truncated, info = env.step(action)
+        action = action_trajectory[step_num]
+        obs, reward, terminated, truncated, info = env.step(action)
         if terminated or truncated:
             break
 
-    is_success = info.get('success', False)
+    success_list.append(float(info.get('success', False)))
 
-    # Plotting logic (Unchanged)
-    if is_success:
-        axs[0].scatter(obs[-9], obs[-8], c='red', label='Hand to Ball')
-        axs[1].scatter(obs[-7], obs[-6], c='red', label='Hand to Target')
-        axs[2].scatter(obs[-5], obs[-4], c='red', label='Successful Test')
-        success_count += 1.0
-    else:
-        axs[0].scatter(obs[-9], obs[-8], c='blue', label='Hand to Ball')
-        axs[1].scatter(obs[-7], obs[-6], c='blue', label='Hand to Target')
-        axs[2].scatter(obs[-5], obs[-4], c='blue', label='Failed Test')
-
-    # MODIFICATION: The file is saved on env.close(). We rename it immediately after.
     env.close()
 
-    # Since we create a new environment for each test, the episode count inside the
-    # wrapper will always be 0. So we know the exact temporary filename.
-    temp_video_filename = f"{temp_name_prefix}-episode-0.mp4"
-    temp_video_path = os.path.join(video_folder, temp_video_filename)
+    if (i + 1) % 100 == 0:
+        print(f"Completed {i+1} episodes, current success rate: {(sum(success_list) / len(success_list)) * 100 :.2f}%")
 
-    # Define the final desired filename
-    final_video_filename = f"{i}_{is_success}.mp4"
-    final_video_path = os.path.join(video_folder, final_video_filename)
+print(f"\nFinal Success rate: {(sum(success_list) / len(success_list)) * 100:.2f}%")
 
-    # Rename the file from its temporary name to the final name
-    os.rename(temp_video_path, final_video_path)
+# --- Plotting (Unchanged) ---
+training_contexts = C.copy()
+test_contexts = np.array(test_contexts)
 
-    if (i + 1) % 10 == 0:
-        print(f"Completed {i + 1} episodes, success rate: {(success_count / (i + 1)) * 100 :.2f}%")
+# Separate successful and failed test contexts for plotting
+success_mask = np.array(success_list, dtype=bool)
+failed_mask = ~success_mask
 
-# --- Final plotting and printing (Unchanged) ---
-for k in range(25):
-    episode = dataset[k]
-    obs = episode.observations
-    axs[0].scatter(obs[0, -9], obs[0, -8], c='black', label='Hand to Ball')
-    axs[1].scatter(obs[0, -7], obs[0, -6], c='black', label='Hand to Target')
-    axs[2].scatter(obs[0, -5], obs[0, -4], c='black', label='Training Data')
+dims = {0: (9, 10), 1: (12, 13)}
+dim_labels = {0: {'xlabel': 'Ball X Position (Absolute)', 'ylabel': 'Ball Y Position (Absolute)'},
+                1: {'xlabel': 'Target X Position (Absolute)', 'ylabel': 'Target Y Position (Absolute)'}}
+plt.figure(figsize=(10, 5))
+for i in range(2):
 
-axs[0].grid()
-axs[1].grid()
-axs[2].grid()
+    dim1, dim2 = dims[i]
+    plt.subplot(1, 2, i + 1)
+    plt.scatter(training_contexts[:, dim1], training_contexts[:, dim2], color='black', label='Training Points')
 
-plt.savefig('evaluation_results.png')
+    plt.scatter(test_contexts[failed_mask, dim1], test_contexts[failed_mask, dim2], color='red', alpha=0.2, label='Fail')
+    plt.scatter(test_contexts[success_mask, dim1], test_contexts[success_mask, dim2], color='green', alpha=0.2, label='Success')
+    
+    plt.xlabel(dim_labels[i]['xlabel'], fontsize=12)
+    plt.ylabel(dim_labels[i]['ylabel'], fontsize=12)
 
-print(f"\nFinal success rate over {num_tests} tests: {(success_count / num_tests) * 100:.2f}%")
-print(f"Evaluation loop completed successfully. Videos are saved in the '{video_folder}' folder.")
+    plt.grid(alpha=0.3)
+
+    plt.xlim(-0.25, 1.25)
+    plt.ylim(-0.25, 1.25)
+
+plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
+plt.tight_layout()
+plt.savefig(f"video_test_{seed}.png")
+plt.show()
+
+
+print("Evaluation loop completed successfully.")
+
+print("\nEvaluation loop completed successfully.")
