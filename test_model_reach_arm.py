@@ -3,29 +3,37 @@ import gymnasium as gym
 import gymnasium_robotics
 import numpy as np
 import torch
-from cnmp_ import CNMP_H, generate_trajectory # Assuming these are your custom modules
+from cnmp_ import CNMP_H, CNMP_H_Small, generate_trajectory # Assuming these are your custom modules
 from scipy.interpolate import interp1d
 from scipy.spatial import ConvexHull
 from utils import sample_from_hull
+from copy import deepcopy
 
 # --- Model and Data Loading (Unchanged) ---
-model = CNMP_H(d_x=1, d_y=5, d_SM=5).double()
-model.load_state_dict(torch.load("save/best_models_reach_arm_v1/model_47600.pth"))
+model = CNMP_H(d_x=1, d_y=6, d_SM=6).double()
+model.load_state_dict(torch.load("save/best_models_reach_arm/model.pth"))
 model.eval()
 
 dataset = minari.load_dataset('D4RL/relocate/human-v2')
 normalization_values = {"actions_min": [], 
                         "actions_max": [],
                         "context_min": [],
-                        "context_max": []}
+                        "context_max": [], 
+                        "context_all_min": [],
+                        "context_all_max": []}
 
 time_len = 451
 
-action_data = np.load('data/reach_arm_actions_v1.npy')  # shape (25, 451, 30)
-observation_data = np.load('data/reach_arm_observations_v1.npy')  # shape (25, 451, 42)
+GRASP_THRESHOLD = 0.0725
+
+action_data = np.load('data/reach_arm_actions.npy')  # shape (25, 451, 30)
+
+observation_data = np.load('data/reach_arm_observations.npy')  # shape (25, 451, 42)
+observation_data_all = np.load('data/reach_arm_observations_all.npy')  # shape (25, 451, 42)
+
 num_data = action_data.shape[0]
 
-Y = np.zeros((num_data, time_len, 5))
+Y = np.zeros((num_data, time_len, 6))
 Y[:, 1:] = action_data[:num_data]
 C = np.zeros((num_data, 15))
 for i in range(num_data):
@@ -47,11 +55,28 @@ for dim in range(C.shape[-1]):
     normalization_values['context_min'].append(C_min)
     normalization_values['context_max'].append(C_max)
 
+
+
+C_all = np.zeros((observation_data_all.shape[0], 15))
+for i in range(observation_data_all.shape[0]):
+    C_all[i, :9] = observation_data_all[i, 0, 30:39]
+    C_all[i, 9:] = observation_data_all[i, 0, 42:]  # add the first observation as context
+for dim in range(C_all.shape[-1]):
+    C_min_all = np.min(C_all[:, dim], axis=0, keepdims=True)
+    C_max_all = np.max(C_all[:, dim], axis=0, keepdims=True)
+    normalization_values['context_all_min'].append(C_min_all)
+    normalization_values['context_all_max'].append(C_max_all)
+
+normalized_training_contexts_all = C_all.copy()
+for dim in range(C_all.shape[-1]):
+    normalized_training_contexts_all[:, dim] = (C_all[:, dim] - normalization_values['context_all_min'][dim]) / \
+                         (normalization_values['context_all_max'][dim] - normalization_values['context_all_min'][dim] + 1e-8)
+    
 normalized_training_contexts = C.copy()
 for dim in range(C.shape[-1]):
     normalized_training_contexts[:, dim] = (C[:, dim] - normalization_values['context_min'][dim]) / \
-                                           (normalization_values['context_max'][dim] - normalization_values['context_min'][dim] + 1e-8)
-    
+                         (normalization_values['context_max'][dim] - normalization_values['context_min'][dim] + 1e-8)
+
 convex_hull = ConvexHull(C[:, [9, 10]].copy())
 
 num_samples = 1000
@@ -64,7 +89,7 @@ test_contexts = []
 success_list = []
 error_list = []
 for i in range(num_samples):
-    env = dataset.recover_environment(max_episode_steps=500, render_mode='human')
+    env = dataset.recover_environment(max_episode_steps=500)#, render_mode='human')
     init_obs, _ = env.reset(seed=420+i)
     env = env.unwrapped
 
@@ -94,12 +119,18 @@ for i in range(num_samples):
     context[9:12] = init_state_dict['obj_pos'].copy()
     context[12:15] = init_state_dict['target_pos'].copy()
 
+    temp_context = deepcopy(context)
+
+    for dim in range(15):
+       temp_context[dim] = (temp_context[dim] - normalization_values['context_all_min'][dim]) / \
+                            (normalization_values['context_all_max'][dim] - normalization_values['context_all_min'][dim] + 1e-8)
+    test_contexts.append(temp_context)
+
+
     for dim in range(15):
         context[dim] = (context[dim] - normalization_values['context_min'][dim]) / \
                        (normalization_values['context_max'][dim] - normalization_values['context_min'][dim] + 1e-8)
         #print("%.3f" % context[dim].item(), end=' ')
-
-    test_contexts.append(context)
 
     traj_length = 450
     action_trajectory = generate_trajectory(model, cnmp_obs, context).squeeze(0)
@@ -113,18 +144,18 @@ for i in range(num_samples):
 
     action = np.zeros((30,))
     for step_num in range(450):
-        action[:5] = action_trajectory[step_num] if step_num < traj_length else action_trajectory[-1]
+        action[:6] = action_trajectory[step_num] if step_num < traj_length else action_trajectory[-1]
         obs, reward, terminated, truncated, info = env.step(action)
-        info['success'] = True if (np.linalg.norm(obs[30:31]) < 0.055 and obs[32] < 0.025) else False
+        info['success'] = True if (np.linalg.norm(obs[30:33] + [0, 0.049, 0]) < GRASP_THRESHOLD) else False
         if terminated or truncated:
             break
             
     success_list.append(info['success']* 1.0)
     
     final_abs_palm = env.data.site_xpos[env.S_grasp_site_id].copy()
-    init_abs_obs = init_state_dict['obj_pos'].copy()
+    init_abs_obj = init_state_dict['obj_pos'].copy()
     
-    error_list.append(np.linalg.norm(final_abs_palm - init_abs_obs))
+    error_list.append(np.linalg.norm(final_abs_palm - init_abs_obj + [0, 0.049, 0]))
     #print(error_list[-1])
 
     env.close()
@@ -145,76 +176,142 @@ failed_mask = ~success_mask
 import matplotlib.pyplot as plt
 
 dims = {0: (9, 10)}
+dim1, dim2 = dims[0]
 dim_labels = {0: {'xlabel': 'Ball X Position (Absolute)', 'ylabel': 'Ball Y Position (Absolute)'}}
 
 
-"""
-plt.figure(figsize=(8, 5))
-for i in range(1):
-    dim1, dim2 = dims[i]
-    plt.subplot(1, 1, i + 1)
-    plt.scatter(training_contexts[:, dim1], training_contexts[:, dim2], color='black', label='Training Points')
+#skip_indices = [0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 13, 14, 16, 17, 20, 21, 22, 23, 24]
+skip_indices = [13]
 
-    plt.scatter(test_contexts[failed_mask, dim1], test_contexts[failed_mask, dim2], color='red', alpha=0.2, label='Fail')
-    plt.scatter(test_contexts[success_mask, dim1], test_contexts[success_mask, dim2], color='green', alpha=0.2, label='Success')
-    
-    plt.xlabel(dim_labels[i]['xlabel'], fontsize=12)
-    plt.ylabel(dim_labels[i]['ylabel'], fontsize=12)
-
-    plt.grid(alpha=0.3)
-
-    plt.xlim(-0.25, 1.25)
-    plt.ylim(-0.25, 1.25)
-
-    for simplex in convex_hull.simplices:
-        plt.plot(training_contexts[simplex, dim1], training_contexts[simplex, dim2], color='blue', alpha=0.5)
-
-    
-
-plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=10)
-plt.tight_layout()
-plt.savefig('reach_success.png')
-plt.show()
-"""
-
-skip_indices = [0, 1, 13, 19, 20, 21]
 plt.figure(figsize=(8, 5))
 # plot color map according to error_list, generate cmap
 cmap = plt.cm.get_cmap('coolwarm')
 norm = plt.Normalize(vmin=0.0, vmax=0.20)
-for i in range(1):
-    dim1, dim2 = dims[i]
-    plt.subplot(1, 1, i + 1)
 
-    skip_count = 0
-    for j in range(25):
+# --- PLOT TRAINING DATA AND CONVEX HULL ---
+# Plot training points and their text labels
+for j in range(normalized_training_contexts_all.shape[0]):
 
-        if j in skip_indices:
-            skip_count += 1
-            continue
+    alpha = 0.8 if j not in skip_indices else 0.2
 
-        plt.scatter(normalized_training_contexts[:, dim1], normalized_training_contexts[:, dim2], color='black', label='Training Points')
-        # add a text, the number of the point
-        plt.text(normalized_training_contexts[j - skip_count, dim1], normalized_training_contexts[j - skip_count, dim2], str(j), fontsize=8, color='black', ha='right', va='bottom')
+    if j == 13: continue
 
-    plt.xlabel(dim_labels[i]['xlabel'], fontsize=12)
-    plt.ylabel(dim_labels[i]['ylabel'], fontsize=12)
+    plt.text(normalized_training_contexts_all[j, dim1], normalized_training_contexts_all[j, dim2], str(j),
+             fontsize=8, color='black', ha='right', va='bottom')
 
-    plt.grid(alpha=0.3)
+    plt.scatter(normalized_training_contexts_all[j, dim1], normalized_training_contexts_all[j, dim2],
+                color='black', label='Training Points' if j == 0 else "", alpha=alpha)
 
-    # plot color map according to error_list
-    scatter = plt.scatter(test_contexts[:, dim1], test_contexts[:, dim2], c=error_list, cmap=cmap, norm=norm, alpha=0.6)
-    plt.colorbar(scatter, label='Error (Norm)')
+# Plot the convex hull
+for simplex in convex_hull.simplices:
+    renormalized_x = (normalized_training_contexts[simplex, dim1] * (normalization_values['context_max'][dim1] - normalization_values['context_min'][dim1]) + normalization_values['context_min'][dim1])
+    renormalized_y = (normalized_training_contexts[simplex, dim2] * (normalization_values['context_max'][dim2] - normalization_values['context_min'][dim2]) + normalization_values['context_min'][dim2])
+    renormalized_x = (renormalized_x - normalization_values['context_all_min'][dim1]) / \
+                     (normalization_values['context_all_max'][dim1] - normalization_values['context_all_min'][dim1] + 1e-8)
+    renormalized_y = (renormalized_y - normalization_values['context_all_min'][dim2]) / \
+                     (normalization_values['context_all_max'][dim2] - normalization_values['context_all_min'][dim2] + 1e-8)
+    plt.plot(renormalized_x, renormalized_y, color='blue', alpha=0.5)
 
-    plt.xlim(-0.25, 1.25)
-    plt.ylim(-0.25, 1.25)
 
-    for simplex in convex_hull.simplices:
-        plt.plot(normalized_training_contexts[simplex, dim1], normalized_training_contexts[simplex, dim2], color='blue', alpha=0.5)
+# --- PLOT TEST DATA, HIGHLIGHTING FAILURES ---
+# 2. Create boolean masks to separate test points based on the threshold
+error_array = np.array(error_list)
+above_threshold_mask = error_array > GRASP_THRESHOLD
+below_threshold_mask = ~above_threshold_mask
 
-#plt.legend(bbox_to_anchor=(1.15, 1), loc='upper left', fontsize=10)
+# Plot points BELOW the threshold (successful grasps)
+# This scatter object will be used to create the colorbar
+sc = plt.scatter(test_contexts[below_threshold_mask, dim1],
+                 test_contexts[below_threshold_mask, dim2],
+                 c=error_array[below_threshold_mask],
+                 cmap=cmap, norm=norm, alpha=0.6,
+                 label=f'Test Point (Error <= {GRASP_THRESHOLD})')
+
+# Plot points ABOVE the threshold (failed grasps) using a different marker
+plt.scatter(test_contexts[above_threshold_mask, dim1],
+            test_contexts[above_threshold_mask, dim2],
+            c=error_array[above_threshold_mask],
+            cmap=cmap, norm=norm, alpha=0.6,
+            marker='X',  # Use 'X' to clearly mark these points
+            s=50,       # Make them larger to stand out
+            label=f'Test Point (Error > {GRASP_THRESHOLD})')
+
+
+# --- FINALIZE AND SHOW PLOT ---
+plt.xlabel(dim_labels[0]['xlabel'], fontsize=12)
+plt.ylabel(dim_labels[0]['ylabel'], fontsize=12)
+plt.title('Grasp Success and Error Analysis', fontsize=14)
+
+plt.grid(alpha=0.3)
+plt.xlim(-0.20, 1.20)
+plt.ylim(-0.20, 1.20)
+
+# Add a colorbar and a legend
+plt.colorbar(sc, label='Error (Norm)')
+plt.legend(loc='best', fontsize=10)
+
 plt.tight_layout()
-plt.savefig('reach_error_v1.png')
+plt.savefig('reach_arm_cmap_v1.png')
+plt.show()
+plt.close()
+
+plt.figure(figsize=(8, 5))
+
+for j in range(normalized_training_contexts_all.shape[0]):
+
+    alpha = 0.8 if j not in skip_indices else 0.2
+
+    if j == 13: continue
+
+    plt.text(normalized_training_contexts_all[j, dim1], normalized_training_contexts_all[j, dim2], str(j),
+             fontsize=8, color='black', ha='right', va='bottom')
+
+    plt.scatter(normalized_training_contexts_all[j, dim1], normalized_training_contexts_all[j, dim2],
+                color='black', label='Training Points' if j == 0 else "", alpha=alpha)
+
+# Plot the convex hull
+for simplex in convex_hull.simplices:
+    renormalized_x = (normalized_training_contexts[simplex, dim1] * (normalization_values['context_max'][dim1] - normalization_values['context_min'][dim1]) + normalization_values['context_min'][dim1])
+    renormalized_y = (normalized_training_contexts[simplex, dim2] * (normalization_values['context_max'][dim2] - normalization_values['context_min'][dim2]) + normalization_values['context_min'][dim2])
+    renormalized_x = (renormalized_x - normalization_values['context_all_min'][dim1]) / \
+                     (normalization_values['context_all_max'][dim1] - normalization_values['context_all_min'][dim1] + 1e-8)
+    renormalized_y = (renormalized_y - normalization_values['context_all_min'][dim2]) / \
+                     (normalization_values['context_all_max'][dim2] - normalization_values['context_all_min'][dim2] + 1e-8)
+    plt.plot(renormalized_x, renormalized_y, color='blue', alpha=0.5)
+
+# --- PLOT TEST DATA, HIGHLIGHTING FAILURES ---
+# 2. Create boolean masks to separate test points based on the threshold
+error_array = np.array(error_list)
+above_threshold_mask = error_array > GRASP_THRESHOLD
+below_threshold_mask = ~above_threshold_mask
+
+# Plot points BELOW the threshold (successful grasps)
+# This scatter object will be used to create the colorbar
+sc = plt.scatter(test_contexts[below_threshold_mask, dim1],
+                 test_contexts[below_threshold_mask, dim2],
+                 c='green', alpha=0.2, 
+                 label=f'Test Point (Error <= {GRASP_THRESHOLD})')
+
+# Plot points ABOVE the threshold (failed grasps) using a different marker
+plt.scatter(test_contexts[above_threshold_mask, dim1],
+            test_contexts[above_threshold_mask, dim2],
+            c = 'red', alpha=0.2,
+            marker='X',  # Use 'X' to clearly mark these points
+            label=f'Test Point (Error > {GRASP_THRESHOLD})')
+
+# --- FINALIZE AND SHOW PLOT ---
+plt.xlabel(dim_labels[0]['xlabel'], fontsize=12)
+plt.ylabel(dim_labels[0]['ylabel'], fontsize=12)
+plt.title('Grasp Success and Error Analysis', fontsize=14)
+
+plt.grid(alpha=0.3)
+plt.xlim(-0.20, 1.20)
+plt.ylim(-0.20, 1.20)
+
+plt.legend(loc='best', fontsize=10)
+
+plt.tight_layout()
+plt.savefig('reach_arm_v1.png')
 plt.show()
 
 print("Evaluation loop completed successfully.")
