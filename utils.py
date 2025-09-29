@@ -2,7 +2,7 @@ import numpy as np
 from scipy.spatial import ConvexHull
 
 
-def sample_from_hull(hull, num_samples):
+def sample_from_hull(hull, num_samples, seed=None):
 
     """
     Generates uniform random samples from within a 2D convex hull.
@@ -18,6 +18,10 @@ def sample_from_hull(hull, num_samples):
     Returns:
         numpy.ndarray: An array of shape (num_samples, 2) of random points.
     """
+
+    if seed is not None:
+        np.random.seed(seed)
+    
     points = hull.points
     # The vertices of the hull in counter-clockwise order
     vertices = hull.vertices
@@ -64,3 +68,25 @@ def sample_from_hull(hull, num_samples):
     random_samples = (1 - sqrt_r1) * A + sqrt_r1 * (1 - r2) * B + sqrt_r1 * r2 * C
     
     return random_samples
+
+
+def calculate_average_jerk_concise(data_array, delta_t=1.0):
+    """
+    Concise function to calculate average jerk magnitude.
+    Jerk = (Data[i+3] - 3*Data[i+2] + 3*Data[i+1] - Data[i]) / (Δt)^3
+    """
+    # Calculate the numerator of the 3rd finite difference
+    jerk_numerator = np.diff(data_array, n=3)
+    
+    # Calculate the denominator
+    dt_cubed = delta_t ** 3
+    
+    jerk = jerk_numerator / dt_cubed
+    
+    # Calculate average magnitude
+    return np.mean(np.abs(jerk))
+
+# Test with the same data and time step
+# known_delta_t = 0.05
+# avg_jerk_real_concise = calculate_average_jerk_concise(position_data, delta_t=known_delta_t)
+# print(f"Average Jerk (Concise, Δt={known_delta_t}): {avg_jerk_real_concise:.6f}")

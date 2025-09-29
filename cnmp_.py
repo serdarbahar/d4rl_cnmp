@@ -75,8 +75,9 @@ class CNMP_H_Small(nn.Module):
         )
 
         self.decoder = nn.Sequential(
-            nn.Linear(d_x + 15 + 256, 512), nn.LayerNorm(512), nn.ReLU(),
+            nn.Linear(d_x + 6 + 256, 512), nn.LayerNorm(512), nn.ReLU(),
             nn.Linear(512, 256), nn.LayerNorm(256), nn.ReLU(),
+            nn.Linear(256, 256), nn.LayerNorm(256), nn.ReLU(),
             nn.Linear(256, 128), nn.LayerNorm(128), nn.ReLU(),
             nn.Linear(128, 2 * d_SM)  # Output mean and std for
         )
@@ -92,12 +93,17 @@ class CNMP_H_Small(nn.Module):
         output = self.decoder(concat) # (2*d_y,)
         return output, r_avg
     
-def generate_trajectory(model, obs, context):
+def generate_trajectory(model, obs, context, return_std=False):
     obs = torch.tensor(obs, dtype=torch.float64).unsqueeze(0)
     mask = torch.ones((1, obs.shape[1], obs.shape[1]), dtype=torch.float64)
-    x_tar = torch.linspace(0, 1, 200, dtype=torch.float64).unsqueeze(0).unsqueeze(-1)
+    x_tar = torch.linspace(0, 1, 450, dtype=torch.float64).unsqueeze(0).unsqueeze(-1)
     context = torch.tensor(context, dtype=torch.float64).unsqueeze(0)
     with torch.no_grad():
         output, _ = model(obs, context, mask, x_tar)
-    mean, _ = output.chunk(2, dim=-1)
-    return mean
+    mean, std = output.chunk(2, dim=-1)
+    std = torch.nn.functional.softplus(std)
+    if return_std:
+        return mean, std
+    else:
+        return mean
+

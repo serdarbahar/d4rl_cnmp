@@ -29,8 +29,16 @@ observations = np.zeros((25, 500, 48))
 actions = np.zeros((25, 500, 30))
 time_lengths = np.zeros((25, 1))
 
-#skip_indices = [0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 13, 14, 16, 17, 20, 21, 22, 23, 24]
-skip_indices = [13]
+skip_indices = [13] # full
+#skip_indices = [0, 1, 2, 4, 6, 7, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24] # v1
+#skip_indices = [0, 1, 2, 4, 6, 7, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24] # v2
+#skip_indices = [0, 1, 2, 4, 6, 7, 10, 11, 13, 14, 15, 17, 18, 19, 20, 21, 22, 24] # v3
+#skip_indices = [0, 1, 2, 4, 6, 7, 8, 10, 11, 13, 14, 15, 17, 18, 19, 20, 21, 22, 24] # v4
+#skip_indices = [0, 1, 2, 4, 6, 7, 8, 10, 11, 13, 14, 15, 16, 17, 19, 20, 21, 22, 24] # v5
+
+action_dim = 6
+
+final_errors = []
 
 for i in range(25):
     if i in skip_indices:
@@ -43,14 +51,14 @@ for i in range(25):
     absolute_episode = dataset_absolute[i]
 
     # Recover the environment. The 'env' object may be wrapped.
-    env = dataset.recover_environment(max_episode_steps=550, render_mode='rgb_array')
+    env = dataset.recover_environment(max_episode_steps=550)#, render_mode='rgb_array')
 
-    env = RecordVideo(
-        env,
-        video_folder=video_folder,
-        name_prefix=temp_name_prefix,
-        episode_trigger=lambda x: True # Record this one episode
-    )
+    #env = RecordVideo(
+    #    env,
+    #    video_folder=video_folder,
+    #    name_prefix=temp_name_prefix,
+    #    episode_trigger=lambda x: True # Record this one episode
+    #)
 
     obs, _ = env.reset()
     
@@ -94,15 +102,23 @@ for i in range(25):
 
     observations[i, 0] = full_obs
 
+    #action = np.ones((30,)) * -1.0
+    #mcp_joint_indices = [8, 12, 16, 21]
+    #for idx in mcp_joint_indices:
+    #    action[idx] = 0.0
+    #action[[27, 28]] = 0
+    #action[29] = 1.0
     action = np.zeros((30,))
 
     #_, __ = env.reset(options={'init_state_dict': new_state_dict})
 
+    hand_distance_array = []
+
     for step_num in range(450):
         if step_num < len(training_episode.actions):
-            action[:6] = training_episode.actions[step_num][:6]
+            action[:action_dim] = training_episode.actions[step_num][:action_dim]
         else:
-            action[:6] = training_episode.actions[-1][:6]
+            action[:action_dim] = training_episode.actions[-1][:action_dim]
         
         # Use the wrapped 'env' for stepping. This allows wrappers to function correctly.
         obs, rew, terminated, truncated, info = env.step(action)
@@ -123,19 +139,29 @@ for i in range(25):
         actions[i, step_num] = action
         observations[i, step_num+1] = full_obs
 
-        if terminated or truncated or ((np.linalg.norm(obs[30:33] + [0, 0.049, 0]) < 0.0725) and step_num > 50):
+        hand_distance = np.linalg.norm(np.linalg.norm(obs[30:33] + [0, 0.049, 0]))
+
+        hand_distance_array.append(hand_distance)
+
+        if terminated or truncated or (step_num > 100 and hand_distance_array[-1] > hand_distance_array[-2]):
+
             for _ in range(step_num + 1, 450):
                 env.step(action)
             break
     
-    print(f"Episode {i+1} finished after {step_num + 1} steps.")
+    print(f"Episode {i+1} finished after {step_num + 1} steps with hand distance {hand_distance_array[-1]:.4f}.")
+    final_errors.append(hand_distance_array[-1])
     time_lengths[i, 0] = step_num + 1
     
     # Close the environment
     env.close()
 
-new_observations = np.zeros((25 - len(skip_indices), 450, 48))
-new_actions = np.zeros((25 - len(skip_indices), 450, 6))
+final_errors = np.array(final_errors)
+np.save("training_errors_reach_arm_full.npy", final_errors)
+
+time_len = 200
+new_observations = np.zeros((25 - len(skip_indices), time_len, 48))
+new_actions = np.zeros((25 - len(skip_indices), time_len, action_dim))
 skip_count = 0
 for i in range(time_lengths.shape[0]):
 
@@ -145,15 +171,15 @@ for i in range(time_lengths.shape[0]):
 
     curr_time_len = int(time_lengths[i, 0])
 
-    act_interp = interp1d(np.arange(curr_time_len), actions[i, :curr_time_len, :6], axis=0)
+    act_interp = interp1d(np.arange(curr_time_len), actions[i, :curr_time_len, :action_dim], axis=0)
     obs_interp = interp1d(np.arange(curr_time_len), observations[i, :curr_time_len, :], axis=0)
-    new_actions[i - skip_count, :, :] = act_interp(np.linspace(0, curr_time_len - 1, 450))
-    new_observations[i - skip_count, :, :] = obs_interp(np.linspace(0, curr_time_len - 1, 450))
+    new_actions[i - skip_count, :, :] = act_interp(np.linspace(0, curr_time_len - 1, time_len))
+    new_observations[i - skip_count, :, :] = obs_interp(np.linspace(0, curr_time_len - 1, time_len))
 
 print(f"Episode {i+1} actions shape: {new_actions.shape}")
 print(f"Episode {i+1} observations shape: {new_observations.shape}")
 
-#np.save(f'data/reach_arm_observations.npy', new_observations)
-#np.save(f'data/reach_arm_actions.npy', new_actions)
+#np.save(f'data/reach_arm_observations_8_v5.npy', new_observations)
+#np.save(f'data/reach_arm_actions_8_v5.npy', new_actions)
 
 print("Evaluation loop completed successfully.")
